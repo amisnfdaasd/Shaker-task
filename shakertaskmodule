@@ -1,0 +1,396 @@
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local GeometryService = game:GetService("GeometryService")
+
+local UtilityFolder = ReplicatedStorage.Player.Utility
+local DrinkIngredientsFolder = ReplicatedStorage.DrinkIngredients
+local localStorage = workspace.localStorage
+
+local effectsFolder = ReplicatedStorage.Effects
+local GlassesFolder = DrinkIngredientsFolder.Glasses
+local remotesFolder = ReplicatedStorage.Remotes
+
+
+local ShakerRemotesFolder = remotesFolder.ShakerTask
+local endShakeTaskRemote = ShakerRemotesFolder.EndShakeTask
+local startShakeTaskRemote = ShakerRemotesFolder.StartShakeTask
+
+local animationsFolder = script.Animations
+local propsFolder =script.props
+local SoundsFolder = script.Sounds
+
+local taskModuleFolder = script.Parent
+local DrinksInfo = require(ReplicatedStorage.Info.DrinksInfo)
+local Constants = require(ReplicatedStorage.Player.Constants)
+local CameraController = require(ReplicatedStorage.Player.Utility.CameraController)
+local PartParentFinder = require(UtilityFolder.PartModelParentFinder)
+local MiniGameGui = require(ReplicatedStorage.Player.Scripts.MiniGameGuiController)
+local WarningModule = require(UtilityFolder.WarningController)
+local ViewportFitter = require(UtilityFolder.ViewportFitter)
+local disconnectAndClear = require(UtilityFolder.disconnectAndClear)
+local anchorCharacterPos = require(UtilityFolder.AnchorCharacterPos)
+local drinkController = require(ReplicatedStorage.Player.Scripts.DrinkController)
+local stopHumanoidAnims = require(UtilityFolder.StopHumanoidAnims)
+
+local taskGuiTemplate = script.ScreenGui
+
+local player = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+local nonUseColor = Color3.fromRGB(91, 0, 0)
+local UseColor = Color3.fromRGB(0, 245, 16)
+local listLength = 5
+local scalePadding = .2
+
+local requiredNum = 8
+
+local userInputList = {
+	[Enum.KeyCode.Up] = { animation = 'UpShake', rotation = 90 },
+	[Enum.KeyCode.Down] = { animation = 'UpShake', rotation = -90 },
+	[Enum.KeyCode.Left] = { animation = 'SideShake', rotation = 0 },
+	[Enum.KeyCode.Right] = { animation = 'SideShake', rotation = 180 },
+}
+
+local shrinkInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local bounceInfo = TweenInfo.new(0.4, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out)
+local popInInfo = TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+local keyboardInputList = {Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right}
+
+local ShakerTask = {}
+ShakerTask.__index = ShakerTask
+
+function ShakerTask.new(applianceHandler, appliance:Model, drink)
+	local taskGuiClone = taskGuiTemplate:Clone()
+	taskGuiClone.Enabled = false
+	taskGuiClone.Parent = player.PlayerGui
+
+	local humanoid = player.Character.Humanoid
+	local animator = humanoid:FindFirstChild("Animator")
+
+	local animations = {}
+	for _, animation in animationsFolder:GetChildren() do
+		if not animation:IsA("Animation") then continue end
+		local animationTrack = animator:LoadAnimation(animation)
+		animations[animation.Name] = animationTrack
+	end
+
+	local self = {
+		applianceModel = appliance,
+		cameraStagesFolder = appliance.CameraStages,
+		taskName = "ShakerTask",
+
+		ScreenGui = taskGuiClone,
+		Playing = false,
+		gameMode = nil,
+		appliancehandler = applianceHandler,
+		drink = drink ,
+		Template = nil,
+		keyList = {},
+		keySize = 1,
+		keyIndex = 3,
+		animations = animations, 
+		correctNum = 0,
+		incorrectNum = 0,
+		buttonConnections = {},
+	}
+	self.miniGameGuiController = MiniGameGui.new(self)
+
+	setmetatable(self, ShakerTask)
+
+	self:initialize()
+
+	return self
+end
+
+function ShakerTask:initialize()
+	self.level = ReplicatedStorage.GameInfo.CurrentLevel.Value
+	local screenGui = self.ScreenGui; screenGui.Enabled = true
+	local taskframe = screenGui.taskFrame; taskframe.Visible = true
+	local goalFrame = taskframe.goalFrame
+	local template = goalFrame:FindFirstChild("Template")
+	self.Template = template; template.Visible = false
+	self.uiGradient = taskframe.cupFill.UIGradient
+
+	local buttonFrame = taskframe:FindFirstChild("buttonFrame")
+	if buttonFrame then
+		buttonFrame.Visible = true
+		self:SetupMobileButtons(buttonFrame)
+	end
+
+	local shaker = startShakeTaskRemote:InvokeServer(self.applianceModel)
+	self.shaker = shaker
+	print(self.shaker)
+
+	self.animations.Idle:Play()
+	CameraController.tweenLockCamera(self.cameraStagesFolder.shakeCamera)
+
+	local positionBlock = self.applianceModel.CharPosition.PositionBlock
+	anchorCharacterPos.AnchorCharacterPos(positionBlock)
+
+	for i = 1, 8 do
+		self:createNewFrame()
+	end
+	self.keyIndex = 3
+	print("ASDASD")
+	self:calibrateFrames()
+	self.miniGameGuiController:StartCountDown(0)
+end
+
+-- Handles sequential staggered pop-in animations and click events using UIScale
+function ShakerTask:SetupMobileButtons(buttonFrame)
+	local frameMappings = {
+		leftFrame = Enum.KeyCode.Left,
+		rightFrame = Enum.KeyCode.Right,
+		upFrame = Enum.KeyCode.Up,
+		downFrame = Enum.KeyCode.Down,
+	}
+
+	-- Gather frames to sort them by LayoutOrder for sequential pop-in
+	local itemsToAnimate = {}
+	for frameName, keyCode in pairs(frameMappings) do
+		local containerFrame = buttonFrame:FindFirstChild(frameName)
+		if containerFrame then
+			local imgButton = containerFrame:FindFirstChildOfClass("ImageButton")
+			if imgButton then
+				table.insert(itemsToAnimate, {
+					Frame = containerFrame,
+					Button = imgButton,
+					Key = keyCode,
+					Order = containerFrame.LayoutOrder or 0
+				})
+			end
+		end
+	end
+
+	-- Sort sequentially by LayoutOrder
+	table.sort(itemsToAnimate, function(a, b)
+		return a.Order < b.Order
+	end)
+
+	-- Setup each button and trigger staggered pop-in sequence
+	for index, item in ipairs(itemsToAnimate) do
+		local imgButton = item.Button
+		local keyCode = item.Key
+
+		imgButton.AnchorPoint = Vector2.new(0.5, 0.5)
+		imgButton.Position = UDim2.new(0.5, 0, 0.5, 0)
+
+		local uiScale = imgButton:FindFirstChildOfClass("UIScale")
+		if not uiScale then
+			uiScale = Instance.new("UIScale")
+			uiScale.Parent = imgButton
+		end
+
+		uiScale.Scale = 0
+
+		task.delay((index - 1) * 0.06, function()
+			if uiScale and uiScale.Parent then
+				TweenService:Create(uiScale, popInInfo, {Scale = 1}):Play()
+			end
+		end)
+
+		-- Click Event Connection
+		local conn = imgButton.Activated:Connect(function()
+			if not self.Playing then return end
+
+			local shrinkTween = TweenService:Create(uiScale, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.85})
+			shrinkTween:Play()
+
+			shrinkTween.Completed:Once(function()
+				if uiScale and uiScale.Parent then
+					TweenService:Create(uiScale, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1}):Play()
+				end
+			end)
+
+			local simulatedInput = {
+				KeyCode = keyCode,
+				UserInputType = Enum.UserInputType.Touch
+			}
+			self:pressKey(simulatedInput)
+		end)
+		table.insert(self.buttonConnections, conn)
+	end
+end
+
+function ShakerTask:getRandomKey()
+	return keyboardInputList[math.random(1, #keyboardInputList)]
+end
+
+function ShakerTask:TweenFrames()
+	for i = self.keyIndex - 2, self.keySize do
+		local listValue = self.keyList[i]
+		if not listValue then break end
+		local frame = listValue.frame
+		listValue.xpos = listValue.xpos - scalePadding
+
+		frame:TweenPosition(UDim2.new(listValue.xpos,0,frame.Position.Y.Scale,0),Enum.EasingDirection.Out,Enum.EasingStyle.Linear,.25, true)
+	end
+end
+
+function ShakerTask:playAnim(inputKeyCode)
+	local entry = userInputList[inputKeyCode]
+	if entry and self.animations[entry.animation] then
+		local sound = self.shaker.Shake
+		sound.PlaybackSpeed = math.random(90, 110) / 100 -- Randomizes pitch between 0.9x and 1.1x
+		sound.Volume = math.random(40, 65) / 100         -- Slightly varies volume between 0.85 and 1.0
+
+		sound:Play()
+		self.animations[entry.animation]:Play()
+	end
+end
+
+
+
+function ShakerTask:pressKey(inputObject: InputObject)
+	local inputKey = inputObject.KeyCode
+
+	if not userInputList[inputKey] or not self.Playing then return end
+
+	local currentFrame = self.keyList[self.keyIndex].frame
+	local currentImage = currentFrame:FindFirstChildOfClass("ImageLabel")
+
+	if self.keyList[self.keyIndex].keyCode == inputKey then
+		self.correctNum += 1
+		SoundsFolder.correct:Play()
+		if currentImage then
+			currentImage.ImageColor3 = UseColor
+		end
+	else
+		self.incorrectNum += 1
+		SoundsFolder.incorrect:Play()
+		if currentImage then
+			currentImage.ImageColor3 = nonUseColor
+		end
+	end
+
+	local frame = self.keyList[self.keyIndex-2].frame
+	if frame then
+		frame:Destroy()
+	end
+	self.keyList[self.keyIndex-2] = nil
+	self.keyIndex += 1
+	self:createNewFrame()
+	self:playAnim(inputKey)
+
+
+	local originalSizeFrame = currentFrame.Size
+	local smallerSizeFrame = UDim2.new(originalSizeFrame.X.Scale * 0.9, originalSizeFrame.X.Offset * 0.9, originalSizeFrame.Y.Scale * 0.9, originalSizeFrame.Y.Offset * 0.9)
+	local sizeTweenFrame = TweenService:Create(currentFrame, TweenInfo.new(.25), {Size = smallerSizeFrame})
+	sizeTweenFrame:Play()
+
+	self:TweenFrames()
+	self:calibrateFrames()
+end
+
+function ShakerTask:calibrateFrames()
+	for i, v in self.keyList do
+		local frame = v.frame
+		local uiStroke: UIStroke = frame.UIStroke
+		if uiStroke then
+			if i == self.keyIndex then
+				uiStroke.Color = UseColor
+			else
+				uiStroke.Color = nonUseColor
+			end
+		end
+	end
+
+	local percentDone = self.correctNum / requiredNum
+	if percentDone < 1 then
+		self.uiGradient.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0),
+			NumberSequenceKeypoint.new(percentDone, 0),
+			NumberSequenceKeypoint.new(percentDone+.01, 1),
+			NumberSequenceKeypoint.new(1, 1)
+		})		
+	else
+		self.Playing = false
+		self.uiGradient.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0),
+			NumberSequenceKeypoint.new(1, 0)
+		})
+		self:End()
+	end
+end
+
+function ShakerTask:createNewFrame()
+	local template: Frame = self.Template
+
+	local frameClone:Frame = template:Clone()
+	local frameImage = frameClone:FindFirstChildOfClass("ImageLabel")
+	frameClone.Visible = true
+	frameClone.Name = self.keySize
+
+	if self.keyList[self.keySize - 1] then
+		frameClone.Position = UDim2.new(self.keyList[self.keySize - 1].xpos + scalePadding,0,frameClone.Position.Y.Scale,0)
+	else
+		frameClone.Position = template.Position
+	end
+
+	local frameValue = self:getRandomKey()
+
+	if frameImage and userInputList[frameValue] then
+		frameImage.Rotation = userInputList[frameValue].rotation
+	end
+
+	self.keyList[self.keySize] = {frame = frameClone, xpos = frameClone.Position.X.Scale, keyCode = frameValue}
+
+	frameClone.Parent = template.Parent
+
+	self.keySize += 1
+	return frameClone
+end
+
+function ShakerTask:processEventBegan(inputObject: InputObject)
+	self:pressKey(inputObject)
+end
+
+function ShakerTask:processEventEnded(inputObject: InputObject)
+	if inputObject.UserInputType == Enum.UserInputType.MouseButton1 then
+		self.mouseDown = false
+	end
+end
+
+--CLASS CONDITIONS--
+
+function ShakerTask:Start()
+	self.Playing = true
+end
+
+function ShakerTask:End()
+	local successPercent = endShakeTaskRemote:InvokeServer(self.drink.Model, self.applianceModel, self.correctNum, self.incorrectNum, requiredNum)
+	local gameInfo = {
+		["SucessPercent"] = successPercent
+	}
+	self.drink:updateShakeScore()
+	self.appliancehandler:EndMiniGame(self.drink, gameInfo)
+end
+
+function ShakerTask:Destroy()
+	self.Playing = false
+
+	for _, conn in ipairs(self.buttonConnections) do
+		conn:Disconnect()
+	end
+	self.buttonConnections = {}
+
+	if self.miniGameGuiController then
+		self.miniGameGuiController:Destroy()
+	end
+
+	anchorCharacterPos.unAnchorCharacterPos()
+	self.animations.Idle:Stop()
+
+	if self.ScreenGui then
+		self.ScreenGui:Destroy()
+	end
+
+	setmetatable(self, nil)
+end
+
+return ShakerTask
